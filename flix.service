@@ -1,0 +1,13 @@
+[Unit]
+Description=Flix NFC video player
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/mads/flix
+ExecStart=/usr/bin/python3 app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
