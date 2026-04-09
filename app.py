@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 JELLYFIN_URL = "http://192.168.50.13:8096"
+CEC_DEVICE = "/dev/cec1"
 JELLYFIN_API_KEY = "da2d114027b54d8abc4b9b38cb3faac4"
 JELLYFIN_USER_ID = "6a88eece9ca74c3db6f52ff5d1850111"
 
@@ -18,12 +19,26 @@ UID_MAP = {
 vlc_process = None
 
 
+def cec_tv_on():
+    """Turn on the TV and switch to this Pi's HDMI input."""
+    subprocess.run(
+        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
+        input="on 0\nas\n",
+        text=True,
+        timeout=10,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def kill_vlc():
     global vlc_process
     if vlc_process and vlc_process.poll() is None:
         vlc_process.terminate()
         vlc_process.wait(timeout=5)
     vlc_process = None
+    # Kill any orphaned VLC processes from previous sessions
+    subprocess.run(["pkill", "-f", "cvlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 @app.route("/play", methods=["POST"])
@@ -42,6 +57,9 @@ def play():
         f"{JELLYFIN_URL}/Videos/{item_id}/stream"
         f"?Static=true&api_key={JELLYFIN_API_KEY}"
     )
+
+    # Turn on the TV and switch to this input
+    cec_tv_on()
 
     # Kill any existing playback
     kill_vlc()
