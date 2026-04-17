@@ -1,10 +1,14 @@
 import base64
+import logging
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 from flask import Flask, request, jsonify
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 app = Flask(__name__)
 
@@ -32,6 +36,7 @@ current_item_id = None
 # Long-running cec-client for both sending commands and receiving remote key events
 cec_process = None
 cec_stdin_lock = threading.Lock()
+cec_ready = threading.Event()
 
 # CEC opcodes and user-control key codes we care about
 CEC_OP_STANDBY = 0x36
@@ -53,6 +58,7 @@ TRAFFIC_RE = re.compile(r">>\s+([0-9a-f]{2}):([0-9a-f]{2})(?::([0-9a-f]{2}))?")
 def cec_start():
     """Start the long-running cec-client subprocess and reader thread."""
     global cec_process
+    cec_ready.clear()
     cec_process = subprocess.Popen(
         ["stdbuf", "-oL", "cec-client", "-d", "8", CEC_DEVICE],
         stdin=subprocess.PIPE,
@@ -62,40 +68,63 @@ def cec_start():
         bufsize=1,
     )
     threading.Thread(target=cec_reader, daemon=True).start()
+    # Wait for cec-client to complete its bus handshake before accepting commands
+    if not cec_ready.wait(timeout=15):
+        logging.warning("cec-client did not signal ready within 15s — commands may fail")
+    else:
+        logging.info("cec-client ready")
+
+
+def cec_ensure_alive():
+    """Restart cec-client if it has exited."""
+    if cec_process and cec_process.poll() is None:
+        return
+    logging.warning("cec-client is dead — restarting")
+    cec_start()
 
 
 def cec_send(command):
-    """Send a command line to the running cec-client."""
+    """Send a command line to the running cec-client, restarting it if necessary."""
+    cec_ensure_alive()
     with cec_stdin_lock:
         try:
             cec_process.stdin.write(command + "\n")
             cec_process.stdin.flush()
         except Exception:
-            pass
+            logging.exception("Failed to send CEC command: %s", command)
 
 
 def cec_tv_on():
     """Turn on the TV and switch to this Pi's HDMI input."""
     cec_send("on 0")
+    time.sleep(3)
     cec_send("as")
 
 
 def cec_reader():
     """Parse cec-client output for remote key events and TV standby broadcasts."""
-    for line in cec_process.stdout:
-        m = TRAFFIC_RE.search(line)
-        if not m:
-            continue
-        addr = int(m.group(1), 16)
-        opcode = int(m.group(2), 16)
-        operand = int(m.group(3), 16) if m.group(3) else None
-        src = addr >> 4
+    try:
+        for line in cec_process.stdout:
+            # cec-client prints "waiting for input" once the bus handshake is done
+            if not cec_ready.is_set() and "waiting for input" in line:
+                cec_ready.set()
+            m = TRAFFIC_RE.search(line)
+            if not m:
+                continue
+            addr = int(m.group(1), 16)
+            opcode = int(m.group(2), 16)
+            operand = int(m.group(3), 16) if m.group(3) else None
+            src = addr >> 4
 
-        if opcode == CEC_OP_STANDBY and src == 0:
-            # TV is going to standby — stop playback
-            kill_vlc()
-        elif opcode == CEC_OP_USER_CONTROL_PRESSED and operand is not None:
-            handle_remote_key(operand)
+            if opcode == CEC_OP_STANDBY and src == 0:
+                # TV is going to standby — stop playback
+                kill_vlc()
+            elif opcode == CEC_OP_USER_CONTROL_PRESSED and operand is not None:
+                handle_remote_key(operand)
+    except Exception:
+        logging.exception("cec_reader crashed")
+    finally:
+        logging.warning("cec_reader exited")
 
 
 def handle_remote_key(code):
@@ -163,11 +192,11 @@ def play():
         f"?Static=true&api_key={JELLYFIN_API_KEY}"
     )
 
+    # Kill any existing playback before turning on the TV
+    kill_vlc()
+
     # Turn on the TV and switch to this input
     cec_tv_on()
-
-    # Kill any existing playback
-    kill_vlc()
 
     # Launch VLC fullscreen on the Wayland display
     env = {
