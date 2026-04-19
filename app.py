@@ -38,6 +38,9 @@ cec_process = None
 cec_stdin_lock = threading.Lock()
 cec_ready = threading.Event()
 
+# Cancel event for the HDMI assertion loop
+assertion_cancel = threading.Event()
+
 # CEC opcodes and user-control key codes we care about
 CEC_OP_STANDBY = 0x36
 CEC_OP_USER_CONTROL_PRESSED = 0x44
@@ -159,6 +162,7 @@ def vlc_command(command, val=None):
 
 def kill_vlc():
     global vlc_process, current_item_id
+    assertion_cancel.set()
     if vlc_process and vlc_process.poll() is None:
         vlc_process.terminate()
         try:
@@ -226,11 +230,20 @@ def play():
     # Re-assert active source after the TV has had more time to finish its
     # own startup/CEC negotiation — avoids the TV briefly switching away
     # from this input on cold start.
-    def deferred_active_source():
-        time.sleep(5)
-        cec_send("as")
+    assertion_cancel.clear()
+    def repeated_active_source(cancel):
+        """Send 'as' every 3s for ~18s to hold the input during TV startup."""
+        for i in range(6):
+            if cancel.wait(timeout=3):
+                logging.info("HDMI assertion cancelled at iteration %d", i)
+                return
+            logging.info("HDMI assertion %d/6", i + 1)
+            cec_send("as")
+        logging.info("HDMI assertion window complete")
 
-    threading.Thread(target=deferred_active_source, daemon=True).start()
+    threading.Thread(
+        target=repeated_active_source, args=(assertion_cancel,), daemon=True
+    ).start()
 
     return jsonify({"status": "playing", "item_id": item_id, "pid": vlc_process.pid})
 
